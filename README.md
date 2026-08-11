@@ -349,8 +349,9 @@ lightweight here; anything substantial enough gets folded into
   triggered an out-of-memory kill; root cause was no swap configured on that
   VM. Fixed by provisioning swap.
 - **Security patching** — media server updated to close out a disclosed CVE.
-- **New service: private game server**, reachable only over the mesh VPN
-  tunnel with no public ingress.
+- **New service: game server**, self-hosted on the Proxmox cluster and
+  exposed via a public domain proxied through the cloud VPS, alongside
+  private access over the mesh VPN.
 - **DDNS automation** for the non-HTTP mesh VPN endpoint (see
   [Protocol-aware proxying](#protocol-aware-proxying)) — a scheduled script
   keeps its DNS record current without manual updates.
