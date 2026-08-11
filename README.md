@@ -29,6 +29,7 @@ and reference.
 - [Incident Writeups](#incident-writeups)
 - [Design Principles](#design-principles)
 - [Tech Stack](#tech-stack)
+- [Changelog](#changelog)
 
 ---
 
@@ -323,6 +324,36 @@ container image-layer growth as a first-class disk-management concern.
 **Monitoring:** Netdata, Tautulli
 **Automation:** Watchtower, cron
 **OS:** Ubuntu, Linux
+
+---
+
+## Changelog
+
+_Last updated: August 2026._ Notable updates since the initial writeup — kept
+lightweight here; anything substantial enough gets folded into
+[Incident Writeups](#incident-writeups) instead.
+
+- **Home-automation network segmentation (in progress).** Moving the
+  home-automation controller onto its own isolated VLAN on the gateway.
+  Weighing a direct gateway firewall rule against routing it through the
+  existing reverse-proxy chain, without breaking the wall-mounted dashboard
+  client.
+- **Gateway firewall hardening pass** — general tightening of Ubiquiti
+  firewall rules beyond the baseline routing/VLAN setup.
+- **New storage integrity issue under investigation.** A ZFS pool reported a
+  degraded state from checksum errors on a virtual disk — a separate incident
+  from the [zombie-process write-up](#1-unkillable-container-from-a-storage-induced-zombie-process)
+  above. Another data point for why the platform leans on ZFS checksumming
+  rather than trusting a green uptime dashboard.
+- **Memory-pressure incident on the photo-backup service.** A bulk upload
+  triggered an out-of-memory kill; root cause was no swap configured on that
+  VM. Fixed by provisioning swap.
+- **Security patching** — media server updated to close out a disclosed CVE.
+- **New service: private game server**, reachable only over the mesh VPN
+  tunnel with no public ingress.
+- **DDNS automation** for the non-HTTP mesh VPN endpoint (see
+  [Protocol-aware proxying](#protocol-aware-proxying)) — a scheduled script
+  keeps its DNS record current without manual updates.
 
 ---
 
