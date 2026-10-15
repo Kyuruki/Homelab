@@ -131,10 +131,13 @@ rebuilt without any risk to the underlying data.
 - SMB/CIFS shares consumed by the media stack and other clients
 - Snapshot capability for point-in-time recovery
 
-ZFS checksumming proved its value during a real incident (see
-[Incident Writeups](#incident-writeups)) where silent disk-level corruption was
-detected and confirmed non-destructive because a scrub repaired 0 bytes with 0
-data errors — the data was intact and verifiable.
+ZFS checksumming has proved its value more than once (see
+[Incident Writeups](#incident-writeups)). In the first case a scrub repaired
+**0 bytes with 0 data errors**, confirming a hypervisor I/O hiccup had not
+touched the data. In a later case a mirror member accumulated real checksum
+errors and a scrub **repaired ~364 KB from the healthy copy with no data loss** —
+the pool stayed `ONLINE` throughout. Mirrored vdevs plus scheduled scrubs are
+what turn a failing disk into a maintenance ticket instead of an outage.
 
 ---
 
@@ -149,6 +152,7 @@ Docker Compose. Highlights:
 | ----------- | -------------------------------------------------- |
 | Jellyfin    | Media server with GPU hardware transcoding         |
 | Immich      | Self-hosted family photo & video backup            |
+| Seerr       | Request management; also brokers client auth to Jellyfin |
 | Tautulli    | Streaming analytics & monitoring                   |
 
 ### Networking & Access
@@ -157,6 +161,20 @@ Docker Compose. Highlights:
 | -------------------- | --------------------------------------------- |
 | Nginx Proxy Manager  | Reverse proxy + Let's Encrypt TLS termination |
 | Tailscale            | Mesh VPN (WireGuard) between nodes            |
+
+### Acquisition & Automation
+
+| Service               | Purpose                                            |
+| --------------------- | -------------------------------------------------- |
+| Sonarr / Radarr       | Series & film library automation                   |
+| Prowlarr / Profilarr  | Indexer management & quality-profile sync          |
+| Bazarr                | Subtitle acquisition                               |
+| Unpackerr             | Post-download extraction                           |
+| qBittorrent + Gluetun | Download client routed entirely through a VPN container |
+
+The download client has **no direct network path of its own** — it shares
+Gluetun's network namespace, so if the VPN container is down the client has no
+connectivity at all rather than leaking traffic over the home WAN.
 
 ### Operations
 
@@ -227,6 +245,20 @@ Knowing *which layer handles which protocol* is a recurring theme of the design.
 - **Scheduled ZFS scrubs** verify data integrity on the storage pool.
 - **Automated cleanup** — a cron job prunes dangling Docker images weekly to keep
   the compute VM's disk usage in check.
+- **Self-healing crons** — two guardrails added after real outages: a mount
+  watchdog on the media VM that remounts dropped CIFS shares, and an SMB service
+  watchdog on the storage VM
+  (`systemctl is-active --quiet smbd || midclt call service.start cifs`). Both run
+  on a 5-minute interval; the interval *is* the worst-case outage window, which is
+  why neither was left hourly.
+- **Memory guardrails** — per-container memory limits on the memory-hungry
+  services (notably the photo stack), a capped ZFS ARC on the storage VM, and
+  `restart: "no"` on manually-invoked batch jobs so an OOM kill doesn't become a
+  restart loop.
+- **Boot ordering** — Proxmox VM start order and delays are set explicitly so
+  storage is serving shares before any consumer VM boots.
+- **SMART monitoring** on the Proxmox host for the pool member with a climbing
+  reallocated-sector count.
 
 ---
 
@@ -295,6 +327,117 @@ recurring weekly prune via cron to prevent silent disk creep going forward.
 **Lesson:** Trust measured per-path numbers over dashboard summaries, and treat
 container image-layer growth as a first-class disk-management concern.
 
+### 4. OOM killer took down SMB, and nothing brought it back
+
+**Symptom:** SMB shares went down repeatedly, sometimes staying down for **19–20
+hours** at a stretch. Jellyfin lost its entire media library each time, and
+nothing in the storage VM's own logs looked like a storage fault.
+
+**Root cause:** A three-layer cascade. The photo-backup service's memory spikes
+pushed the storage VM into out-of-memory territory; the kernel's OOM killer
+picked **`smbd`** as a victim; and nothing was configured to restart it, so the
+shares simply stayed gone until someone noticed. The reason there was no headroom
+to begin with was **ZFS ARC**, which defaults to roughly half of RAM (~11.5 GB on
+a 12 GB VM) and left almost nothing for everything else. An earlier attempt to
+cap ARC had been written with `tee` but **never actually applied**, so a second
+outage happened while the fix was believed to be in place.
+
+**Resolution:** Four changes, deliberately layered from cause to symptom:
+
+1. Raised the storage VM from 12 GB to 16 GB
+   (`qm set <storage-vmid> --memory 16384` — which requires a full stop/start,
+   not a reboot, to take effect).
+2. Set a **persistent 6 GB ARC cap** via a TrueNAS Post-Init script, so it
+   survives reboots instead of living in a shell session.
+3. Gave the photo service a hard **6 GB container memory limit** so it can't
+   consume the headroom that was just created.
+4. Added the `smbd` self-heal cron as a last-resort backstop on a 5-minute
+   interval.
+
+**Lesson:** Verify that a mitigation actually applied — an unverified fix is
+worse than no fix, because it stops you looking. And a cache that sizes itself to
+"half of RAM" is a liability on a VM where RAM is shared with real workloads:
+cap it explicitly. The self-heal cron is the least important of the four changes
+and the only one that would have been visible on a dashboard.
+
+### 5. Boot-order race plus metadata on the wrong storage tier
+
+**Symptom:** After a routine host reboot the media VM came up effectively
+unreachable, and Jellyfin either hung on startup or took 20+ seconds with
+processes stuck in uninterruptible (`D`) sleep.
+
+**Root cause:** Several independent problems surfaced together:
+
+- **Boot race** — the storage VM wasn't serving SMB yet when the media VM booted,
+  so its CIFS mounts failed outright and Jellyfin had no metadata path.
+- **Wrong storage tier** — Jellyfin's 3.7 GB metadata directory lived *on the
+  CIFS share* with `cache=none`. Thousands of small-file reads over an uncached
+  network mount is close to the worst possible access pattern, and it was the
+  real source of the hangs.
+- **A silently broken container** — the extraction service had been failing for
+  **11 days** because its `:latest` image shipped a non-executable binary. Being
+  on `:latest` is what introduced it; nothing alerted on it.
+
+**Resolution:** Set explicit Proxmox startup ordering and delay so storage boots
+first and consumers wait for it (`--startup order=1,up=90` on storage,
+`order=2` on the media VM). Moved Jellyfin's metadata to **local disk** and
+repointed the compose mapping — startup dropped from 20+ seconds (or hanging) to
+**7.6 seconds**. Pinned the extraction container to an explicit version tag, and
+switched the whole automation stack to **monitor-only** Watchtower labels so
+auto-updates can report rather than break.
+
+**Lesson:** Distinguish *data* from *working state*. Bulk media belongs on the
+network share; small-file, latency-sensitive state belongs on local disk. And
+unattended auto-updates on `:latest` trade a known maintenance cost for an
+unknown outage at an unpredictable time.
+
+### 6. VPN port forward never reaching the download client
+
+**Symptom:** The download client reported itself as "firewalled" and barely
+connected to peers, despite the VPN container holding a healthy connection and a
+successfully forwarded port from the provider.
+
+**Root cause:** The forwarded port is assigned dynamically by the VPN provider and
+changes on reconnect, but the hook that pushes it into the client
+(`VPN_PORT_FORWARDING_UP_COMMAND`) was **empty**. The VPN container had a current
+forwarded port; the client was still listening on a stale one from a previous
+session. Both halves looked healthy in isolation, which is exactly why it went
+unnoticed.
+
+**Resolution:** Populated the up-command so the VPN container pushes the new port
+into the client's API on every reconnect, and allowed localhost API calls to
+bypass authentication so the hook can actually reach it. Recreated both
+containers together and confirmed a `200 OK` in the VPN logs and the live port in
+the client's own config. Also excluded the VPN container from automated updates
+(`com.centurylinklabs.watchtower.enable=false`) — restarting it alone strands the
+client in a dead network namespace, since the client has no network stack of its
+own.
+
+**Lesson:** When two components are each individually healthy, suspect the
+plumbing between them. Anything dynamic needs an explicit propagation hook, and
+containers that share a network namespace must be updated and restarted as a unit.
+
+### 7. Telling a dying disk apart from virtualization noise
+
+**Symptom:** A mirror member in the storage pool reported checksum errors. The
+same disk had thrown errors months earlier, at which point they were attributed
+to a host-side I/O hiccup — and that diagnosis was correct at the time.
+
+**Root cause:** By the second occurrence the picture had changed: **read errors,
+checksum errors, and a climbing reallocated-sector count**. Reallocated sectors
+are reported by the drive's own firmware and cannot be produced by a hypervisor
+hiccup, which is what moved this from "noise" to "the disk is failing".
+
+**Resolution:** A scrub repaired **~364 KB** from the healthy mirror copy with
+**no data loss**; the pool remained `ONLINE` and the mirror partner stayed clean.
+Errors were cleared and the disk put on a periodic SMART check from the Proxmox
+host, with a replacement planned if the reallocated-sector count keeps climbing.
+
+**Lesson:** The same symptom can have different causes at different times — a
+past diagnosis is a hypothesis, not a verdict. Pick the metric that can only come
+from the layer you're accusing (here, firmware-reported reallocated sectors) and
+let it decide.
+
 ---
 
 ## Design Principles
@@ -311,6 +454,10 @@ container image-layer growth as a first-class disk-management concern.
   DNS-only for non-HTTP protocols. Be deliberate about what each layer does.
 - **Operational hygiene** — monitoring, automated updates with controlled
   pinning, scheduled integrity scrubs, and automated cleanup.
+- **Verify the fix, not the intent** — a mitigation that was applied in a shell
+  and never persisted caused a second outage. Confirm the running state.
+- **Fix causes, keep a backstop** — self-heal crons exist, but underneath each one
+  is an actual root-cause fix. A watchdog is the last line, never the plan.
 
 ---
 
@@ -320,7 +467,9 @@ container image-layer growth as a first-class disk-management concern.
 **Storage:** TrueNAS, ZFS, SMB/CIFS
 **Containers:** Docker, Docker Compose, Portainer
 **Networking:** Cloudflare, Nginx Proxy Manager, Tailscale (WireGuard), Ubiquiti
-**Media:** Jellyfin (NVENC hardware transcoding), Immich, Tautulli
+**Media:** Jellyfin (NVENC hardware transcoding), Immich, Seerr, Tautulli
+**Automation:** Sonarr, Radarr, Prowlarr, Bazarr, Profilarr, Unpackerr
+**Privacy:** Gluetun (VPN container with namespace-shared download client)
 **Monitoring:** Netdata, Tautulli
 **Automation:** Watchtower, cron
 **OS:** Ubuntu, Linux
@@ -329,9 +478,43 @@ container image-layer growth as a first-class disk-management concern.
 
 ## Changelog
 
-_Last updated: August 2026._ Notable updates since the initial writeup — kept
+_Last updated: October 2026._ Notable updates since the initial writeup — kept
 lightweight here; anything substantial enough gets folded into
 [Incident Writeups](#incident-writeups) instead.
+
+- **Storage VM memory re-provisioning and a capped ZFS ARC**, plus per-container
+  memory limits on the photo stack — see
+  [the SMB/OOM write-up](#4-oom-killer-took-down-smb-and-nothing-brought-it-back).
+- **Explicit Proxmox boot ordering** so storage is serving shares before any
+  consumer VM starts.
+- **Jellyfin metadata relocated to local disk** from the CIFS share; startup time
+  down from 20+ seconds to ~7.6 seconds.
+- **Update policy tightened** — the automation stack moved to monitor-only
+  Watchtower labels, the extraction container pinned to an explicit version, and
+  the VPN container excluded from automated restarts entirely.
+- **WebSocket support enabled** on the reverse-proxy host for the photo service,
+  resolving persistent client WebSocket errors.
+- **Failing pool member under watch.** Read/checksum errors plus a climbing
+  reallocated-sector count on one mirror member — now on periodic SMART checks
+  with a replacement planned. See
+  [the dying-disk write-up](#7-telling-a-dying-disk-apart-from-virtualization-noise).
+
+### Open items
+
+- **Photo service intermittently returns 502/504 through its public hostname**
+  while other services work through the same proxy chain, and it responds
+  correctly on the LAN at the exact backend the proxy targets. That isolates it to
+  mesh reachability from the cloud VPS to that specific VM — next step is a direct
+  `curl` from the VPS plus a check of mesh status and advertised subnet routes.
+  Unconfirmed.
+- **Third-party Jellyfin client fails login with a 302.** Two likely causes: it
+  authenticates via the request manager's auth endpoint rather than the media
+  server directly, so it needs the request manager's hostname; and an `http://`
+  URL gets upgraded to HTTPS by the proxy chain, which **drops the POST body** on
+  redirect. Unconfirmed.
+- **Slow download-client Web UI startup.** The client itself restores 262 torrents
+  in ~2 seconds, so the delay is in the image's init steps or the VPN container's
+  connect time, not the application. Open.
 
 - **Home-automation network segmentation (in progress).** Moving the
   home-automation controller onto its own isolated VLAN on the gateway.
