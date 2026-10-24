@@ -1,6 +1,6 @@
 # Self-Hosted Homelab & Cloud Infrastructure
 
-A production-grade, self-hosted infrastructure platform running 13+ containerized
+A production-grade, self-hosted infrastructure platform running 18+ containerized
 services across a Proxmox virtualization cluster, with ZFS network storage,
 GPU-accelerated media transcoding, and a zero-trust remote access architecture
 exposing services to the public internet with **zero open inbound ports** on the
@@ -145,7 +145,7 @@ what turn a failing disk into a maintenance ticket instead of an outage.
 
 ## Service Inventory
 
-The platform runs **13+ containerized services**, defined declaratively via
+The platform runs **18+ containerized services**, defined declaratively via
 Docker Compose. Highlights:
 
 ### Media
