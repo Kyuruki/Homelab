@@ -26,6 +26,8 @@ and reference.
 - [Service Inventory](#service-inventory)
 - [Networking & Remote Access](#networking--remote-access)
 - [Observability & Maintenance](#observability--maintenance)
+- [Alerting](#alerting)
+- [Secrets Management](#secrets-management)
 - [Incident Writeups](#incident-writeups)
 - [Design Principles](#design-principles)
 - [Tech Stack](#tech-stack)
@@ -153,7 +155,7 @@ Docker Compose. Highlights:
 | Jellyfin    | Media server with GPU hardware transcoding         |
 | Immich      | Self-hosted family photo & video backup            |
 | Seerr       | Request management; also brokers client auth to Jellyfin |
-| Tautulli    | Streaming analytics & monitoring                   |
+| Immich AI analysis | On-demand AI photo descriptions via a local LLM (Compose profile, off by default) |
 
 ### Networking & Access
 
@@ -181,13 +183,18 @@ connectivity at all rather than leaking traffic over the home WAN.
 | Service     | Purpose                                            |
 | ----------- | -------------------------------------------------- |
 | Portainer   | Container management UI                            |
-| Netdata     | Real-time host & container metrics                 |
 | Homepage    | Unified service dashboard                          |
-| Watchtower  | Automated container image updates                  |
+| Watchtower  | Automated container image updates, with push notifications |
+| Uptime Kuma | External uptime checks (runs on the cloud VPS)     |
+| ntfy        | Self-hosted push-notification server (cloud VPS)   |
 
 The media services share a dedicated Docker bridge network and read media from
 the TrueNAS SMB mounts, keeping storage centralized and the compute layer
 stateless.
+
+Heavy, occasional workloads — the local LLM and the photo-analysis job that uses
+it — sit behind a **Docker Compose profile**, so a plain `docker compose up -d`
+skips them and they only run when explicitly started with `--profile analyze`.
 
 ---
 
@@ -238,8 +245,8 @@ Knowing *which layer handles which protocol* is a recurring theme of the design.
 
 ## Observability & Maintenance
 
-- **Netdata** provides real-time per-container and host-level metrics.
-- **Tautulli** tracks media streaming activity and transcode load.
+- **Uptime Kuma** checks every service from outside the home network and pushes
+  down/recovery alerts — see [Alerting](#alerting).
 - **Watchtower** automates image updates, with specific containers intentionally
   pinned to named tags so updates are controlled rather than surprise-breaking.
 - **Scheduled ZFS scrubs** verify data integrity on the storage pool.
@@ -258,7 +265,89 @@ Knowing *which layer handles which protocol* is a recurring theme of the design.
 - **Boot ordering** — Proxmox VM start order and delays are set explicitly so
   storage is serving shares before any consumer VM boots.
 - **SMART monitoring** on the Proxmox host for the pool member with a climbing
-  reallocated-sector count.
+  reallocated-sector count. SMART lives on the host rather than in TrueNAS on
+  purpose: the disks are passed to the storage VM by ID, so TrueNAS only sees
+  virtual disks and can't read real SMART data (it still sees ZFS-level errors).
+
+---
+
+## Alerting
+
+Every layer now pushes an alert to a phone when something breaks: a service
+goes down, a container updates, the pool degrades, the hypervisor reports an
+event — or the alerting server itself goes offline.
+
+| Event                                           | Source                    | Channel         |
+| ----------------------------------------------- | ------------------------- | --------------- |
+| Service down / recovered, host ping failures    | Uptime Kuma (cloud VPS)   | Push (`homelab-down`)    |
+| Container updated or update available           | Watchtower (media VM)     | Push (`homelab-updates`) |
+| Pool degraded, checksum errors, scrub problems  | TrueNAS                   | Push (`homelab-storage`) |
+| Backups, SMART warnings, host events            | Proxmox                   | Push (`homelab-storage`) |
+| Cloud VPS offline (takes the alerting stack with it) | Healthchecks.io      | Email           |
+
+### Design
+
+- **Alerts live off-site.** The push server (**ntfy**) and the uptime monitor
+  (**Uptime Kuma**) run on the cloud VPS, not at home — an alerting system
+  hosted on the thing it monitors goes silent exactly when it's needed.
+- **Monitored from the outside in.** Uptime Kuma checks each home service over
+  the mesh VPN, the same path real traffic takes. Key services get **two checks
+  — direct and public**: if the public one fails and the direct one passes, the
+  service is fine and the proxy chain is what broke.
+- **One check can cover two containers.** The download client shares the VPN
+  container's network namespace, so if the VPN dies the client's Web UI becomes
+  unreachable — its uptime check doubles as the VPN check.
+- **Deny-by-default push server.** ntfy runs with `auth-default-access: deny-all`;
+  nothing can read or publish without a login. Services publish with a scoped
+  access token, and the server's port is bound to Docker's bridge gateway
+  address only, so the reverse proxy can reach it but the internet can't.
+- **A dead man's switch for the watchers.** If the VPS goes down, the push
+  server and uptime monitor go down with it and nothing alerts. So the VPS pings
+  an external **Healthchecks.io** check every 5 minutes from cron; if the pings
+  stop, it emails. It's outbound-only — no open ports — and deliberately uses
+  email rather than push, since push would be down too.
+- **Adapting tools that don't speak ntfy.** Proxmox uses a generic webhook
+  target with the token stored as a webhook secret. TrueNAS has no ntfy
+  integration, so it uses a **Slack-type alert service** pointed at ntfy, which
+  converts the Slack-style JSON with a message template and takes its
+  credentials from a URL parameter.
+- **Every path was tested end to end** — e.g. pointing one monitor at an unused
+  port to confirm a down alert *and* a recovery alert arrived.
+
+### Lessons from the build
+
+- **A monitor without a notification target is just a dashboard.** Uptime Kuma
+  detected the first test failure and sent nothing, because no notification had
+  been attached yet. Notifications are now default-enabled on every monitor.
+- **A defined secret isn't a used secret.** The Proxmox webhook returned `403`
+  because the token was stored as a secret but never referenced in a header.
+- **`401` vs `403` tells you which half is wrong:** with ntfy, a `401` means a
+  bad token; a `403` means no credentials were sent at all.
+- **Token rotation has a blast radius.** The push token lives in four places
+  (the media VM's env file, the uptime monitor, the Proxmox webhook, and the
+  TrueNAS URL), so rotation is a documented checklist that ends with revoking
+  the old token.
+
+---
+
+## Secrets Management
+
+All credentials (VPN account, API keys, the push token) were moved out of the
+media stack's `docker-compose.yml` into a separate `.env` file beside it, owned
+by the service user with mode `600`. The compose file now holds only `${...}`
+references, which Compose fills in automatically.
+
+- **The cleanup found a leak.** Two editor emergency-save files
+  (`docker-compose.yml.save`, `.save.1`) were sitting next to the compose file —
+  one contained the VPN password in plain text. Both were deleted.
+- **`sudo cat > file` doesn't work** for writing a root-owned file: the
+  redirect runs as the calling user, not root. `sudo tee file > /dev/null` does.
+- **Validated before applying** with `docker compose config`, then confirmed the
+  VPN container still came up with a forwarded port and pushed it to the client.
+- Changing a credential is now: edit `.env`, run `docker compose up -d`. Compose
+  only recreates containers whose resolved values changed — which is also why
+  the VPN container showed `Running` rather than recreated after the migration:
+  its values were identical, so Compose correctly saw no change.
 
 ---
 
@@ -467,10 +556,10 @@ let it decide.
 **Storage:** TrueNAS, ZFS, SMB/CIFS
 **Containers:** Docker, Docker Compose, Portainer
 **Networking:** Cloudflare, Nginx Proxy Manager, Tailscale (WireGuard), Ubiquiti
-**Media:** Jellyfin (NVENC hardware transcoding), Immich, Seerr, Tautulli
+**Media:** Jellyfin (NVENC hardware transcoding), Immich, Seerr
 **Automation:** Sonarr, Radarr, Prowlarr, Bazarr, Profilarr, Unpackerr
 **Privacy:** Gluetun (VPN container with namespace-shared download client)
-**Monitoring:** Netdata, Tautulli
+**Monitoring & Alerting:** Uptime Kuma, ntfy, Healthchecks.io
 **Automation:** Watchtower, cron
 **OS:** Ubuntu, Linux
 
@@ -498,9 +587,26 @@ lightweight here; anything substantial enough gets folded into
   reallocated-sector count on one mirror member — now on periodic SMART checks
   with a replacement planned. See
   [the dying-disk write-up](#7-telling-a-dying-disk-apart-from-virtualization-noise).
+- **Push alerting across every layer** — self-hosted ntfy and Uptime Kuma on the
+  cloud VPS, with Watchtower, Proxmox, and TrueNAS all wired in, plus an external
+  dead man's switch on the VPS itself. See [Alerting](#alerting).
+- **Secrets moved out of the compose file** into a locked-down `.env`; stray
+  editor backups containing a plaintext credential found and deleted. See
+  [Secrets Management](#secrets-management).
+- **On-demand AI containers** — the local LLM and photo-analysis job moved
+  behind a Compose profile so they no longer run by default.
 
 ### Open items
 
+- **Email as a second alert channel** for the storage and hypervisor alerts,
+  alongside push.
+- **Cloud-provider firewall on the VPS.** Docker-published ports bypass the
+  host firewall, so inbound filtering has to happen at the provider's firewall
+  instead, with admin interfaces reachable only over the mesh VPN.
+- **Tune noisy alert topics** after a few days of real alerts — a severity
+  filter on the hypervisor's notification matcher, or muting update notices.
+- **Re-check the failing pool member** with `smartctl -a` from the host: high
+  CRC errors with clean sectors would point to a cable rather than the disk.
 - **Photo service intermittently returns 502/504 through its public hostname**
   while other services work through the same proxy chain, and it responds
   correctly on the LAN at the exact backend the proxy targets. That isolates it to
