@@ -241,6 +241,32 @@ DDoS benefits. Non-HTTP services that Cloudflare's proxy can't tunnel — e.g. a
 chosen path, since proxying raw UDP through an HTTP proxy would silently fail.
 Knowing *which layer handles which protocol* is a recurring theme of the design.
 
+### Locking down the VPS edge
+
+The home side had zero inbound ports, but the VPS itself did not. An external
+recon pass found that a DNS-only record (required for the game server, which
+Cloudflare's proxy can't carry) revealed the VPS's public IP. On that IP:
+
+- **The reverse proxy's admin UI was publicly reachable.**
+- **Cloudflare could be bypassed entirely** — sending a request straight to the
+  VPS IP with the right `Host` header was served normally, skipping the WAF and
+  its rate limits.
+- **SSH was open to the internet.**
+
+Docker-published ports bypass the host firewall, so the fix had to live at the
+**cloud provider's firewall**, in front of the VM:
+
+- Web ports accept connections **only from Cloudflare's published IP ranges**,
+  so every request has to pass through the WAF.
+- SSH and the proxy admin UI have **no public rule at all** — they're reachable
+  only over the mesh VPN, with the provider's web console as the break-glass path.
+- Only the game server port, the mesh VPN's UDP port, and ICMP stay open to all.
+
+Verified from outside afterwards: admin and SSH ports filtered, direct-to-IP
+requests time out, and every service still answers normally through Cloudflare.
+The lesson: **every DNS-only record discloses an origin**, so whatever sits
+behind it has to be safe to expose on its own.
+
 ---
 
 ## Observability & Maintenance
@@ -595,14 +621,18 @@ lightweight here; anything substantial enough gets folded into
   [Secrets Management](#secrets-management).
 - **On-demand AI containers** — the local LLM and photo-analysis job moved
   behind a Compose profile so they no longer run by default.
+- **Cloud-provider firewall on the VPS** — web ports locked to Cloudflare's
+  ranges, SSH and the proxy admin UI moved to mesh-VPN-only. Closed a publicly
+  reachable admin UI and a WAF bypass found during external recon. See
+  [Locking down the VPS edge](#locking-down-the-vps-edge).
 
 ### Open items
 
 - **Email as a second alert channel** for the storage and hypervisor alerts,
   alongside push.
-- **Cloud-provider firewall on the VPS.** Docker-published ports bypass the
-  host firewall, so inbound filtering has to happen at the provider's firewall
-  instead, with admin interfaces reachable only over the mesh VPN.
+- **Mesh VPN access policy.** The VPS is the only internet-facing node, so
+  scope it with tagged ACLs to just the backends and ports it proxies or
+  monitors, instead of the default allow-all across the mesh.
 - **Tune noisy alert topics** after a few days of real alerts — a severity
   filter on the hypervisor's notification matcher, or muting update notices.
 - **Re-check the failing pool member** with `smartctl -a` from the host: high
