@@ -463,11 +463,16 @@ outage happened while the fix was believed to be in place.
    (`qm set <storage-vmid> --memory 16384` — which requires a full stop/start,
    not a reboot, to take effect).
 2. Set a **persistent 6 GB ARC cap** via a TrueNAS Post-Init script, so it
-   survives reboots instead of living in a shell session.
+   survives reboots instead of living in a shell session. _(ARC cap later
+   lowered to 4 GB.)_
 3. Gave the photo service a hard **6 GB container memory limit** so it can't
    consume the headroom that was just created.
 4. Added the `smbd` self-heal cron as a last-resort backstop on a 5-minute
-   interval.
+   interval. _(Update 2026-11-11: found misconfigured as `5 * * * *`, hourly at
+   :05, and corrected to `*/5 * * * *`. `smbd` now also restarts itself within
+   5 seconds via a systemd override — see
+   [incident 8](#8-smb-down-again-a-per-container-memory-limit-that-wasnt-one) —
+   so the cron is only a backup.)_
 
 **Lesson:** Verify that a mitigation actually applied — an unverified fix is
 worse than no fix, because it stops you looking. And a cache that sizes itself to
@@ -553,6 +558,57 @@ past diagnosis is a hypothesis, not a verdict. Pick the metric that can only com
 from the layer you're accusing (here, firmware-reported reallocated sectors) and
 let it decide.
 
+### 8. SMB down again: a per-container memory limit that wasn't one
+
+**Summary:** The storage VM ran out of memory for ~23 minutes. The OOM killer
+repeatedly killed the photo service's containers and, once, `smbd`. SMB stayed
+down for ~30 minutes, both CIFS mounts on the media VM hung, and Jellyfin lost
+its library until a self-heal check restarted the service. This is a recurrence
+of [incident 4](#4-oom-killer-took-down-smb-and-nothing-brought-it-back): the
+memory limit added there did not mean what it appeared to.
+
+**Timeline:**
+
+- **11:28:42** — the photo service's machine-learning container goes unhealthy
+  under load.
+- **11:29** — global OOM on the storage VM (no swap); photo containers are
+  OOM-killed and crash-loop.
+- **11:36:17** — the OOM killer takes `smbd` (`Failed with result 'oom-kill'`).
+  Clients get port 445 refused; CIFS mounts on the media VM hang.
+- **11:52** — memory pressure subsides; `smbd` is still down.
+- **12:05** — the self-heal cron (`systemctl is-active smbd || midclt call service.start cifs`)
+  finally restarts it. It was meant to run every 5 minutes but was misconfigured
+  as `5 * * * *` (hourly at :05), which is why the outage lasted ~30 minutes.
+
+**Root cause:** The TrueNAS Apps memory limit (6 GB) applies **per container,
+not per app**. Immich runs four containers (server, machine learning, Postgres,
+Redis), so its real ceiling was far above what the 16 GB VM could spare beside
+the 4 GB ARC cap and TrueNAS itself. Disk failure was ruled out: the Proxmox
+host's kernel log showed no ATA/I/O errors in the window, and `zpool status` was
+clean. Media downloads were running at the time but were not the cause.
+
+**Fix:**
+
+1. **`smbd` protected from the OOM killer and self-restarting** — a systemd
+   drop-in with `OOMScoreAdjust=-900` and `Restart=on-failure`, written to `/run`
+   by a TrueNAS Post Init command, because TrueNAS overwrites persistent system
+   config ([`scripts/truenas/smbd-oom-protect.sh`](scripts/truenas/smbd-oom-protect.sh)).
+2. **Photo service job concurrency set to 1** for every job, flattening the
+   memory spikes.
+3. **Self-heal cron corrected** from `5 * * * *` to `*/5 * * * *`. It's now only
+   a backup for the systemd restart.
+
+**Verification:** `systemctl show smbd -p OOMScoreAdjust -p Restart -p RestartUSec`
+returns `-900` / `on-failure` / `5s`. The diagnosis came from `journalctl`
+filtered for `smbd|oom|killed|hung_task`, `docker stats --no-stream` (which shows
+the per-container limits), and `free -h` checked against `zfs_arc_max`.
+
+**Lesson:** Check what a limit is attached to: a "6 GB limit" on a four-container
+app is a 24 GB limit. And the file server should never be the cheapest process to
+kill. With `smbd` protected and restarted by systemd, a 30-minute outage becomes
+a 5-second blip at worst. Cron schedules deserve the same check as any other
+fix: `5 * * * *` and `*/5 * * * *` differ by one character and a factor of 12.
+
 ---
 
 ## Design Principles
@@ -625,6 +681,9 @@ lightweight here; anything substantial enough gets folded into
   ranges, SSH and the proxy admin UI moved to mesh-VPN-only. Closed a publicly
   reachable admin UI and a WAF bypass found during external recon. See
   [Locking down the VPS edge](#locking-down-the-vps-edge).
+- **`smbd` OOM-protected and self-restarting** after the photo stack's
+  per-container memory limit turned out not to cap the app as a whole. See
+  [the SMB recurrence write-up](#8-smb-down-again-a-per-container-memory-limit-that-wasnt-one).
 
 ### Open items
 
