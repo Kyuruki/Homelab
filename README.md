@@ -284,6 +284,10 @@ behind it has to be safe to expose on its own.
   (`systemctl is-active --quiet smbd || midclt call service.start cifs`). Both run
   on a 5-minute interval; the interval *is* the worst-case outage window, which is
   why neither was left hourly.
+- **VPN restart watcher** — a systemd service on the media VM recreates the
+  download client whenever the VPN container starts, so the client never sits in
+  a dead network namespace (see
+  [incident 9](#9-vpn-container-restarted-itself-and-stranded-the-download-client)).
 - **Memory guardrails** — per-container memory limits on the memory-hungry
   services (notably the photo stack), a capped ZFS ARC on the storage VM, and
   `restart: "no"` on manually-invoked batch jobs so an OOM kill doesn't become a
@@ -531,7 +535,10 @@ containers together and confirmed a `200 OK` in the VPN logs and the live port i
 the client's own config. Also excluded the VPN container from automated updates
 (`com.centurylinklabs.watchtower.enable=false`) — restarting it alone strands the
 client in a dead network namespace, since the client has no network stack of its
-own.
+own. _(Update 2026-11-24: the VPN container now restarts itself on repeated
+port-forward failures, so the exclusion alone wasn't enough. A watcher service
+now recreates the client on every VPN container start — see
+[incident 9](#9-vpn-container-restarted-itself-and-stranded-the-download-client).)_
 
 **Lesson:** When two components are each individually healthy, suspect the
 plumbing between them. Anything dynamic needs an explicit propagation hook, and
@@ -609,6 +616,70 @@ kill. With `smbd` protected and restarted by systemd, a 30-minute outage becomes
 a 5-second blip at worst. Cron schedules deserve the same check as any other
 fix: `5 * * * *` and `*/5 * * * *` differ by one character and a factor of 12.
 
+### 9. VPN container restarted itself and stranded the download client
+
+**Summary:** The uptime monitor reported the download client down
+(`ECONNREFUSED`). The VPN provider changed something on its side, and the
+outdated Gluetun image could no longer verify the port-forwarding certificate.
+After ~2 hours of failed retries Gluetun restarted itself, and the client was
+left attached to the old, dead network namespace. It happened twice in one
+night. Fixed by updating Gluetun; a watcher service now reattaches the client
+automatically whenever Gluetun restarts.
+
+**Timeline (2026-11-23 → 24):**
+
+- **Nov 20** — port forwarding healthy; the up-command from
+  [incident 6](#6-vpn-port-forward-never-reaching-the-download-client) pushes the
+  port into the client (`200`).
+- **Nov 23, 16:57** — Watchtower updates and recreates the client. Unrelated.
+  Gluetun, excluded from updates since incident 6, is 16 commits behind.
+- **19:18** — the VPN reconnects. Every port-forward attempt from here fails with
+  `x509: certificate is valid for Server-XXXXX-8a, not Server-XXXXX-4a`, on three
+  different provider servers.
+- **21:22** — after ~2 hours of retries, Gluetun's port-forward loop crashes and
+  the container restarts itself. The client stays `Up` but is attached to the
+  dead namespace and unreachable. Alert fires.
+- **~21:46** — deleted Gluetun's saved port-forward state and restarted Gluetun,
+  then the client. Service returned but port forwarding still failed, ruling out
+  stale state.
+- **~2 hours later** — same crash, same alert.
+- **Nov 24, 01:22** — recreated Gluetun on the newer `:latest` image, then the
+  client. Port forwarding succeeded and the up-command set the new port.
+- **01:24–01:29** — installed and tested the watcher. First test reattached the
+  client but the push returned `403` (topic needs a login); with a token added,
+  the test notification arrived.
+
+**Root cause:** Three layers:
+
+1. The old Gluetun image failed certificate verification against the provider's
+   port-forwarding API after a provider-side change. The newer image handles it.
+2. Repeated port-forward failures make Gluetun **restart itself** — so excluding
+   it from Watchtower didn't actually prevent solo restarts.
+3. The client uses `network_mode: service:gluetun`. When Gluetun restarts, the
+   client keeps the old namespace and can't be reached until it is recreated.
+
+**Fix:**
+
+1. **Gluetun updated** to the current `:latest` image.
+2. **`gluetun-watch` systemd service** on the media VM: watches Docker events for
+   Gluetun starting, waits until it reports healthy, runs
+   `docker-compose up -d --force-recreate --no-deps qbittorrent`, and pushes a
+   "Gluetun restarted, qBittorrent reattached" notification to `homelab-down`.
+   Enabled at boot, restarts if it stops.
+
+**Verification:** `docker logs gluetun 2>&1 | grep "port forwarded is"` shows
+the new port; `journalctl -u gluetun-watch` shows the reattach; the test push
+arrived on the phone.
+
+**Decision:** Not pinning Gluetun. The old version is what broke, and updating
+fixed it. With the watcher in place, a Gluetun update no longer takes the client
+down, so letting Watchtower update it again is an option.
+
+**Lesson:** Excluding a container from auto-updates doesn't stop it restarting —
+the process can restart itself. Fix the coupling (reattach on every start)
+instead of trying to prevent every restart. And holding a container back from
+updates has its own failure mode: it drifts until an external change breaks it.
+
 ---
 
 ## Design Principles
@@ -649,7 +720,7 @@ fix: `5 * * * *` and `*/5 * * * *` differ by one character and a factor of 12.
 
 ## Changelog
 
-_Last updated: October 2026._ Notable updates since the initial writeup — kept
+_Last updated: November 2026._ Notable updates since the initial writeup — kept
 lightweight here; anything substantial enough gets folded into
 [Incident Writeups](#incident-writeups) instead.
 
@@ -684,9 +755,21 @@ lightweight here; anything substantial enough gets folded into
 - **`smbd` OOM-protected and self-restarting** after the photo stack's
   per-container memory limit turned out not to cap the app as a whole. See
   [the SMB recurrence write-up](#8-smb-down-again-a-per-container-memory-limit-that-wasnt-one).
+- **VPN container updated and a restart watcher added** after an outdated
+  Gluetun image broke port forwarding and its self-restarts stranded the download
+  client. See
+  [the VPN restart write-up](#9-vpn-container-restarted-itself-and-stranded-the-download-client).
 
 ### Open items
 
+- **Port-forward health check.** An uptime monitor that queries the download
+  client's API for `connection_status == "connected"`, to catch port-forward
+  failures before they crash the VPN container. Needs the monitor allowed past
+  the client's auth, or an API login.
+- **Scoped publish-only push token** for the VPN watcher, replacing the admin
+  token it uses now; then revoke the old one.
+- **Let Watchtower update Gluetun again** (optional), now that a restart no
+  longer strands the client.
 - **Email as a second alert channel** for the storage and hypervisor alerts,
   alongside push.
 - **Mesh VPN access policy.** The VPS is the only internet-facing node, so
